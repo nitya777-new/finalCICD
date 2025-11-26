@@ -40,7 +40,7 @@ jobs:
           PIP_DEFAULT_TIMEOUT: 120
         run: |
           python -m pip install --upgrade pip
-          # Install CPU-only torch to avoid source builds
+          # Install CPU-only torch (explicit index avoids source builds)
           python -m pip install --no-cache-dir "torch" --index-url https://download.pytorch.org/whl/cpu
           if [ -f requirements.txt ]; then
             python -m pip install --no-cache-dir -r requirements.txt
@@ -48,18 +48,45 @@ jobs:
             python -m pip install --no-cache-dir ultralytics opencv-python-headless mlflow "dvc[s3]" pyyaml
           fi
 
-      - name: Configure DVC remote (DagsHub)
+      - name: Verify installs
+        run: |
+          python - <<'PY'
+import importlib, sys
+pkgs = ("torch","dvc","mlflow","ultralytics")
+for p in pkgs:
+    try:
+        importlib.import_module(p)
+        print(p, "ok")
+    except Exception as e:
+        print(p, "import failed:", e, file=sys.stderr)
+PY
+
+      - name: Configure DVC remote (DagsHub)  # <<--- FIXED STEP: builds URL variable and quotes it
         env:
           DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
           DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
           # remove any old origin to avoid conflicts
           dvc remote remove origin 2>/dev/null || true
+
+          # add s3-style remote (canonical name)
           dvc remote add -d origin s3://dvc
-          dvc remote modify origin endpointurl https://dagshub.com/${DAGSHUB_REPO}.s3
-          dvc remote modify origin --local access_key_id ${DAGSHUB_TOKEN}
-          dvc remote modify origin --local secret_access_key ${DAGSHUB_TOKEN}
+
+          # build endpoint URL safely (ensures single argument)
+          REPO="${DAGSHUB_REPO}"
+          URL="https://dagshub.com/${REPO}.s3"
+
+          # set the endpoint (quote the URL so it's passed as a single value)
+          dvc remote modify origin endpointurl "$URL"
+
+          # store token locally (not committed to repo)
+          dvc remote modify origin --local access_key_id "${DAGSHUB_TOKEN}"
+          dvc remote modify origin --local secret_access_key "${DAGSHUB_TOKEN}"
+
+          # diagnostics for logs
+          echo "=== dvc remote list ==="
           dvc remote list || true
+          echo "=== .dvc/config.local preview ==="
           sed -n '1,200p' .dvc/config.local || true
 
       - name: dvc pull (safe)
