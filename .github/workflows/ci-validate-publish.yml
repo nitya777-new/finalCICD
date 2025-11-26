@@ -43,7 +43,6 @@ jobs:
         env:
           PIP_DEFAULT_TIMEOUT: 120
         run: |
-          # retry helper
           retry() {
             n=0
             until [ $n -ge 3 ]
@@ -58,14 +57,11 @@ jobs:
             fi
           }
 
-          # ensure pip is recent
           retry python -m pip install --upgrade pip
 
-          # install CPU-only torch first to avoid accidental builds from source
-          # you can pin the torch version if desired; this uses official CPU index
+          # Install CPU-only torch from official index (pin if desired)
           retry python -m pip install --no-cache-dir "torch" --index-url https://download.pytorch.org/whl/cpu
 
-          # install requirements.txt if present, else install a safe fallback
           if [ -f requirements.txt ]; then
             retry python -m pip install --no-cache-dir -r requirements.txt
           else
@@ -74,15 +70,19 @@ jobs:
 
       - name: Verify installed packages
         run: |
-          python -c "import torch; print('torch', torch.__version__)"
           python - <<'PY'
-import importlib
+import sys, importlib
+try:
+    import torch
+    print("torch", torch.__version__)
+except Exception as e:
+    print("torch import failed:", e, file=sys.stderr)
 for pkg in ("dvc","mlflow","ultralytics"):
     try:
-        m=importlib.import_module(pkg)
+        importlib.import_module(pkg)
         print(pkg, "ok")
     except Exception as e:
-        print(pkg, "import failed:", e)
+        print(pkg, "import failed:", e, file=sys.stderr)
 PY
 
       - name: Configure DVC remote (DagsHub)
@@ -90,27 +90,20 @@ PY
           DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
           DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
-          # remove any existing origin to avoid conflicts
           dvc remote remove origin 2>/dev/null || true
-
-          # add s3-style remote and set endpoint to DagsHub repo storage
           dvc remote add -d origin s3://dvc
           dvc remote modify origin endpointurl https://dagshub.com/${DAGSHUB_REPO}.s3
-
-          # store token locally in config.local (not committed)
           dvc remote modify origin --local access_key_id ${DAGSHUB_TOKEN}
           dvc remote modify origin --local secret_access_key ${DAGSHUB_TOKEN}
-
           echo "=== dvc remote list ==="
           dvc remote list || true
-
           echo "=== .dvc/config.local (preview) ==="
           sed -n '1,200p' .dvc/config.local || true
 
       - name: dvc pull (if remote data needed)
         run: |
           dvc pull || echo "no remote data to pull or pull failed"
- 
+
       - name: Run evaluation (lightweight)
         run: |
           if [ -f "data/data.yaml" ]; then
@@ -118,12 +111,7 @@ PY
           else
             echo "No data/data.yaml; skipping full eval. Running smoke test inference if example image exists."
             if [ -f "assets/example.jpg" ]; then
-              python - <<'PY'
-from ultralytics import YOLO
-m=YOLO("models/best.pt")
-res=m("assets/example.jpg")
-print(res)
-PY
+              python -c "from ultralytics import YOLO; print(YOLO('models/best.pt')('assets/example.jpg'))"
             else
               echo "No example image found; skipping inference."
             fi
@@ -155,7 +143,10 @@ mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
 mlflow.set_experiment("vehicle-detection")
 summary = {}
 if os.path.exists("eval_summary.json"):
-    summary = json.load(open("eval_summary.json"))
+    try:
+        summary = json.load(open("eval_summary.json"))
+    except Exception:
+        summary = {}
 with mlflow.start_run():
     for k,v in (summary.items() if isinstance(summary, dict) else []):
         try:
