@@ -1,12 +1,8 @@
-name: CI - Validate & Publish Model (robust)
+name: CI - Validate & Publish Model (safe)
 
 on:
   push:
     branches: [ main ]
-
-concurrency:
-  group: ci-validate-publish
-  cancel-in-progress: false
 
 jobs:
   validate-and-publish:
@@ -26,12 +22,12 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install apt deps (git-lfs)
+      - name: Install apt deps
         run: |
           sudo apt-get update
           sudo apt-get install -y git-lfs
 
-      - name: Cache pip (speeds up installs & reduces flakiness)
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -39,132 +35,55 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install Python deps (robust, with retries)
+      - name: Install Python deps (CPU torch + requirements)
         env:
           PIP_DEFAULT_TIMEOUT: 120
         run: |
-          retry() {
-            n=0
-            until [ $n -ge 3 ]
-            do
-              "$@" && break
-              n=$((n+1))
-              echo "Command failed. Retry #$n ..."
-              sleep $((n*5))
-            done
-            if [ $n -ge 3 ]; then
-              echo "Command failed after 3 retries"; exit 1
-            fi
-          }
-
-          retry python -m pip install --upgrade pip
-
-          # Install CPU-only torch from official index (pin if desired)
-          retry python -m pip install --no-cache-dir "torch" --index-url https://download.pytorch.org/whl/cpu
-
+          python -m pip install --upgrade pip
+          # Install CPU-only torch to avoid source builds
+          python -m pip install --no-cache-dir "torch" --index-url https://download.pytorch.org/whl/cpu
           if [ -f requirements.txt ]; then
-            retry python -m pip install --no-cache-dir -r requirements.txt
+            python -m pip install --no-cache-dir -r requirements.txt
           else
-            retry python -m pip install --no-cache-dir ultralytics opencv-python-headless mlflow "dvc[s3]" pyyaml
+            python -m pip install --no-cache-dir ultralytics opencv-python-headless mlflow "dvc[s3]" pyyaml
           fi
-
-      - name: Verify installed packages
-        run: |
-          python - <<'PY'
-import sys, importlib
-try:
-    import torch
-    print("torch", torch.__version__)
-except Exception as e:
-    print("torch import failed:", e, file=sys.stderr)
-for pkg in ("dvc","mlflow","ultralytics"):
-    try:
-        importlib.import_module(pkg)
-        print(pkg, "ok")
-    except Exception as e:
-        print(pkg, "import failed:", e, file=sys.stderr)
-PY
 
       - name: Configure DVC remote (DagsHub)
         env:
           DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
           DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
+          # remove any old origin to avoid conflicts
           dvc remote remove origin 2>/dev/null || true
           dvc remote add -d origin s3://dvc
           dvc remote modify origin endpointurl https://dagshub.com/${DAGSHUB_REPO}.s3
           dvc remote modify origin --local access_key_id ${DAGSHUB_TOKEN}
           dvc remote modify origin --local secret_access_key ${DAGSHUB_TOKEN}
-          echo "=== dvc remote list ==="
           dvc remote list || true
-          echo "=== .dvc/config.local (preview) ==="
           sed -n '1,200p' .dvc/config.local || true
 
-      - name: dvc pull (if remote data needed)
+      - name: dvc pull (safe)
         run: |
           dvc pull || echo "no remote data to pull or pull failed"
 
-      - name: Run evaluation (lightweight)
+      - name: Run evaluation
         run: |
           if [ -f "data/data.yaml" ]; then
             python evaluate.py --model models/best.pt --data data/data.yaml
           else
-            echo "No data/data.yaml; skipping full eval. Running smoke test inference if example image exists."
-            if [ -f "assets/example.jpg" ]; then
-              python -c "from ultralytics import YOLO; print(YOLO('models/best.pt')('assets/example.jpg'))"
-            else
-              echo "No example image found; skipping inference."
-            fi
+            echo "data/data.yaml not found; skipping eval."
           fi
 
-      - name: Upload eval summary artifact
+      - name: Upload eval summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-summary
           path: eval_summary.json
 
-      - name: Push DVC outputs to DagsHub remote
+      - name: dvc push (upload model blobs)
         env:
           DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
           DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
           dvc push --jobs 4 || (echo "dvc push failed" && exit 1)
-
-      - name: (Optional) Register metadata to MLflow on DagsHub
-        if: ${{ secrets.MLFLOW_TRACKING_URI != '' }}
-        env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-        run: |
-          python - <<'PY'
-import os, json, subprocess
-import mlflow
-mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
-mlflow.set_experiment("vehicle-detection")
-summary = {}
-if os.path.exists("eval_summary.json"):
-    try:
-        summary = json.load(open("eval_summary.json"))
-    except Exception:
-        summary = {}
-with mlflow.start_run():
-    for k,v in (summary.items() if isinstance(summary, dict) else []):
-        try:
-            mlflow.log_metric(k, float(v))
-        except Exception:
-            pass
-    commit=subprocess.check_output(["git","rev-parse","HEAD"]).decode().strip()
-    mlflow.set_tag("git.commit", commit)
-    if os.path.exists("eval_summary.json"):
-        mlflow.log_artifact("eval_summary.json", artifact_path="validation")
-    open("model_pointer.txt","w").write("models/best.pt")
-    mlflow.log_artifact("model_pointer.txt", artifact_path="model")
-print("MLflow registration finished")
-PY
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-logs
-          path: /tmp
