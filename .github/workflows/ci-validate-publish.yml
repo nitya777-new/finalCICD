@@ -24,7 +24,7 @@ jobs:
 
       - name: Install apt deps
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y git-lfs
 
       - name: Cache pip
@@ -40,7 +40,6 @@ jobs:
           PIP_DEFAULT_TIMEOUT: 120
         run: |
           python -m pip install --upgrade pip
-          # Install CPU-only torch (explicit index avoids source builds)
           python -m pip install --no-cache-dir "torch" --index-url https://download.pytorch.org/whl/cpu
           if [ -f requirements.txt ]; then
             python -m pip install --no-cache-dir -r requirements.txt
@@ -50,40 +49,30 @@ jobs:
 
       - name: Verify installs
         run: |
-          python - <<'PY'
-import importlib, sys
-pkgs = ("torch","dvc","mlflow","ultralytics")
-for p in pkgs:
-    try:
-        importlib.import_module(p)
-        print(p, "ok")
-    except Exception as e:
-        print(p, "import failed:", e, file=sys.stderr)
-PY
+          python -c "import importlib,sys; print('torch:', __import__('torch').__version__ if importlib.util.find_spec('torch') else 'missing')"
+          python -c "import importlib,sys; print('dvc ok' if importlib.util.find_spec('dvc') else 'dvc missing')"
+          python -c "import importlib,sys; print('mlflow ok' if importlib.util.find_spec('mlflow') else 'mlflow missing')"
+          python -c "import importlib,sys; print('ultralytics ok' if importlib.util.find_spec('ultralytics') else 'ultralytics missing')"
 
-      - name: Configure DVC remote (DagsHub)  # <<--- FIXED STEP: builds URL variable and quotes it
+      - name: Configure DVC remote (DagsHub)
         env:
           DAGSHUB_REPO: ${{ secrets.DAGSHUB_REPO }}
           DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
-          # remove any old origin to avoid conflicts
+          # remove previous origin if any
           dvc remote remove origin 2>/dev/null || true
 
-          # add s3-style remote (canonical name)
+          # add canonical s3 remote name
           dvc remote add -d origin s3://dvc
 
-          # build endpoint URL safely (ensures single argument)
+          # build endpoint safely and quote it
           REPO="${DAGSHUB_REPO}"
           URL="https://dagshub.com/${REPO}.s3"
 
-          # set the endpoint (quote the URL so it's passed as a single value)
           dvc remote modify origin endpointurl "$URL"
-
-          # store token locally (not committed to repo)
           dvc remote modify origin --local access_key_id "${DAGSHUB_TOKEN}"
           dvc remote modify origin --local secret_access_key "${DAGSHUB_TOKEN}"
 
-          # diagnostics for logs
           echo "=== dvc remote list ==="
           dvc remote list || true
           echo "=== .dvc/config.local preview ==="
