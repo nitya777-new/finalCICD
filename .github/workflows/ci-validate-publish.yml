@@ -49,10 +49,17 @@ jobs:
 
       - name: Verify installs
         run: |
-          python -c "import importlib,sys; print('torch:', __import__('torch').__version__ if importlib.util.find_spec('torch') else 'missing')"
-          python -c "import importlib,sys; print('dvc ok' if importlib.util.find_spec('dvc') else 'dvc missing')"
-          python -c "import importlib,sys; print('mlflow ok' if importlib.util.find_spec('mlflow') else 'mlflow missing')"
-          python -c "import importlib,sys; print('ultralytics ok' if importlib.util.find_spec('ultralytics') else 'ultralytics missing')"
+          python - <<'PY'
+          import importlib
+          packages = ("torch","dvc","mlflow","ultralytics")
+          for p in packages:
+           try:
+             importlib.import_module(p)
+              print(p, "ok")
+          except Exception as e:
+              print(p, "missing or import failed:", e)
+          PY
+
 
       - name: Configure DVC remote (DagsHub)
         env:
